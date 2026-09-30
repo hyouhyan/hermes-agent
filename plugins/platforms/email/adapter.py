@@ -416,6 +416,15 @@ def _attach_file(msg: MIMEMultipart, path: Path, filename: str) -> None:
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
+    # ``send()`` splits bodies over MAX_MESSAGE_LENGTH into sequential emails, so the router must NOT
+    # apply its own MAX_PLATFORM_OUTPUT cap (4000, sized for Telegram): a long cron digest delivered to
+    # email was being cut mid-sentence at 4k despite email's 50k-per-body headroom.
+    splits_long_messages = True
+    # Re-exposed as a class attribute because generic consumers read the budget off the ADAPTER
+    # (``base.py``'s effective-limit helper, the streaming fallback, the turn runner) and fall back to
+    # 4096 when it is missing — which pre-split email replies into 4k pieces before send() ever ran.
+    MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+
     # Per-account seen-UID snapshot surviving adapter recreation: the reconnect watcher builds a FRESH
     # adapter per retry; without this connect(is_reconnect=True) would re-mark the mailbox seen and skip
     # mail that arrived during the outage. Keyed by address (multiplex runs several accounts); same-process only.
@@ -777,8 +786,27 @@ class EmailAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Send an email reply to the given address."""
-        return await self._run_send(self._send_email, (chat_id, content, reply_to), "[Email] Send failed to %s: %s", chat_id)
+        """Send an email reply, splitting bodies over MAX_MESSAGE_LENGTH into sequential emails.
+
+        Only the FIRST part threads onto ``reply_to``; later parts chain off the previous part's
+        Message-ID so a long digest reads in order. The returned result always carries the first
+        part's Message-ID, so a failure partway through reports the error while still naming what
+        was already delivered — a caller that retries on a null id would re-send the whole body.
+        """
+        parts = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
+        result = await self._run_send(self._send_email, (chat_id, parts[0], reply_to),
+                                      "[Email] Send failed to %s: %s", chat_id)
+        if not result.success:
+            return result
+        prev_id = result.message_id
+        for index, part in enumerate(parts[1:], start=2):
+            follow = await self._run_send(self._send_email, (chat_id, part, prev_id),
+                                          "[Email] Send failed to %s: %s", chat_id)
+            if not follow.success:
+                return SendResult(success=False, message_id=result.message_id,
+                                  error=f"part {index}/{len(parts)} failed: {follow.error}")
+            prev_id = follow.message_id
+        return result
 
     def _message_id_domain(self) -> str:
         """Domain for generated Message-IDs; ``localhost`` when EMAIL_ADDRESS lacks ``@``."""

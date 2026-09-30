@@ -12,10 +12,14 @@ Covers:
 9. Message dispatch and threading
 """
 
+import asyncio
 import os
+import smtplib
+import tempfile
 import unittest
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from pathlib import Path
 from unittest.mock import patch, MagicMock, ANY
 
 
@@ -571,6 +575,90 @@ class TestSendMethods(unittest.TestCase):
         finally:
             os.unlink(tmp_path)
 
+
+
+    def test_router_hands_oversized_cron_output_to_email_uncapped(self):
+        """The router must not apply its Telegram-sized cap to an email body.
+
+        ``_cap_oversized_output`` truncates for adapters that cannot chunk; email declares
+        ``splits_long_messages`` and splits in ``send()``, so it has to receive the whole payload.
+        Without that declaration a long cron digest arrived cut mid-sentence at MAX_PLATFORM_OUTPUT.
+        """
+        from gateway.delivery import DeliveryRouter, MAX_PLATFORM_OUTPUT
+
+        adapter = self._make_adapter()
+        digest = "Cron digest line\n" * MAX_PLATFORM_OUTPUT
+        self.assertGreater(len(digest), MAX_PLATFORM_OUTPUT)
+
+        with tempfile.TemporaryDirectory() as tmp_home:
+            with patch("gateway.delivery.get_hermes_home", return_value=Path(tmp_home)):
+                capped = DeliveryRouter._cap_oversized_output(
+                    MagicMock(), adapter, digest, "job-1")
+
+        self.assertEqual(capped, digest)
+        self.assertNotIn("truncated, full output saved to", capped)
+
+    def test_effective_message_limit_reads_email_budget_not_the_default(self):
+        """Generic consumers read the per-body budget off the ADAPTER, so it must be a class attr.
+
+        ``base.py``'s effective-limit helper, the streaming fallback and the turn runner all do
+        ``getattr(adapter, "MAX_MESSAGE_LENGTH", 4096)``. With the constant only at module level the
+        getattr missed and email replies were pre-split into 4k pieces before ``send()`` ever ran.
+        """
+        from plugins.platforms.email.adapter import MAX_MESSAGE_LENGTH
+
+        adapter = self._make_adapter()
+        self.assertEqual(getattr(adapter, "MAX_MESSAGE_LENGTH", None), MAX_MESSAGE_LENGTH)
+        self.assertEqual(adapter.truncate_message("z" * (MAX_MESSAGE_LENGTH - 1),
+                                                  adapter.MAX_MESSAGE_LENGTH).__len__(), 1)
+
+    def test_body_over_max_message_length_splits_into_threaded_emails(self):
+        """Bodies past MAX_MESSAGE_LENGTH split into parts that chain by Message-ID."""
+        adapter = self._make_adapter()
+        sent = []
+
+        def fake_send(to, body, reply_to=None, **kw):
+            sent.append((body, reply_to))
+            return f"<id{len(sent)}@t>"
+
+        with patch.object(adapter, "_send_email", side_effect=fake_send):
+            result = asyncio.run(
+                adapter.send("user@test.com", "x" * (adapter.MAX_MESSAGE_LENGTH * 2 + 100),
+                             reply_to="<orig@t>")
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(sent), 3)
+        self.assertTrue(all(len(body) <= adapter.MAX_MESSAGE_LENGTH for body, _ in sent))
+        # First part threads onto the original; each later part replies to the previous part.
+        self.assertEqual([reply_to for _, reply_to in sent],
+                         ["<orig@t>", "<id1@t>", "<id2@t>"])
+        self.assertEqual(result.message_id, "<id1@t>")
+
+    def test_failure_partway_through_a_split_keeps_the_delivered_message_id(self):
+        """A part failing mid-sequence reports failure but still names what was delivered.
+
+        Returning a null id would read as "nothing was sent" and a retry would re-deliver the
+        parts that already landed.
+        """
+        adapter = self._make_adapter()
+        sent = []
+
+        def fake_send(to, body, reply_to=None, **kw):
+            sent.append(body)
+            if len(sent) == 2:
+                raise smtplib.SMTPDataError(552, b"message too large")
+            return f"<id{len(sent)}@t>"
+
+        with patch.object(adapter, "_send_email", side_effect=fake_send):
+            result = asyncio.run(
+                adapter.send("user@test.com", "x" * (adapter.MAX_MESSAGE_LENGTH * 2 + 100))
+            )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.message_id, "<id1@t>")
+        self.assertIn("part 2/3", result.error or "")
+        self.assertEqual(len(sent), 2)  # stops at the failure, no further parts attempted
 
 
 class TestConnectDisconnect(unittest.TestCase):
